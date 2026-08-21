@@ -11,6 +11,7 @@ use std::{collections::HashMap, io::Write, net::Ipv4Addr, str::FromStr, time::Du
 use backon::{BlockingRetryable, ExponentialBuilder};
 use clap::{Args, Subcommand, ValueEnum};
 use doublezero_cli_core::CliContext;
+use doublezero_ip_proof::IpOwnershipProof;
 use doublezero_sdk::{
     commands::{
         multicastgroup::{
@@ -32,6 +33,7 @@ use solana_sdk::pubkey::Pubkey;
 use crate::{
     client::{DaemonClient, LatencyRecord, StatusResponse},
     helpers::{init_spinner, resolve_client_ip},
+    ip_proof::{HttpIpProofClient, IpProofClient, IpProofError},
     latency::{best_latency, retrieve_latencies, select_tunnel_endpoint},
     ledger::LedgerClient,
     requirements::check_daemon,
@@ -105,6 +107,11 @@ pub struct Connect {
     #[arg(long, global = true)]
     pub device: Option<String>,
 
+    /// Base URL of the RFC-27 IP ownership verification service, overriding the environment
+    /// default. Point this at a local or devnet verifier; `DZ_IP_VERIFIER_URL` does the same.
+    #[arg(long, global = true)]
+    pub ip_verifier_url: Option<String>,
+
     /// Verbose output
     #[arg(short, long, global = true, default_value_t = false)]
     pub verbose: bool,
@@ -159,12 +166,112 @@ fn check_accesspass<L: LedgerClient>(
     Ok(accesspass.last_access_epoch >= epoch)
 }
 
+/// The RFC-27 `user_type` a parsed mode will create a user as. The proof binds `user_type`, and
+/// one `connect` invocation only ever creates one kind of user, so one proof covers it.
+fn proof_user_type(mode: &ParsedDzMode) -> UserType {
+    match mode {
+        ParsedDzMode::Ibrl(user_type, _) => *user_type,
+        ParsedDzMode::Multicast { .. } | ParsedDzMode::MulticastFeeds { .. } => UserType::Multicast,
+    }
+}
+
+/// Obtains a proof, or explains why there is none.
+///
+/// A refusal is not fatal. The program is the enforcement point: without a proof, creation
+/// succeeds while `require-ip-ownership-proof` is clear and fails with a named error once it is
+/// set. Breaking `connect` here would take every host in a not-yet-enforcing environment offline
+/// the moment a verifier went down.
+///
+/// The one hard failure is a proof for an address other than the one being provisioned. The
+/// service signs what it observed; the daemon reports what it discovered. When those disagree the
+/// host's verification request and its tunnel traffic leave by different paths, and neither
+/// address is safe to use — attaching the proof guarantees an onchain rejection, and dropping it
+/// binds an address nobody proved.
+fn obtain_ip_proof<P: IpProofClient, W: Write>(
+    proof_client: &P,
+    payer: Pubkey,
+    user_type: UserType,
+    client_ip: Ipv4Addr,
+    out: &mut W,
+) -> eyre::Result<Option<IpOwnershipProof>> {
+    let proof = match proof_client.request_proof(payer, user_type, client_ip) {
+        Ok(proof) => proof,
+        Err(IpProofError::NotConfigured) => {
+            tracing::debug!("no IP ownership verification service configured; continuing");
+            return Ok(None);
+        }
+        Err(err @ IpProofError::Declined { .. }) => {
+            writeln!(out, "⚠️  {err}")?;
+            writeln!(
+                out,
+                "    Continuing without an IP ownership proof. This will be rejected onchain \
+                 once IP ownership verification is required for this environment."
+            )?;
+            return Ok(None);
+        }
+        Err(err) => {
+            writeln!(out, "⚠️  {err}")?;
+            writeln!(
+                out,
+                "    Continuing without an IP ownership proof. This will be rejected onchain \
+                 once IP ownership verification is required for this environment."
+            )?;
+            return Ok(None);
+        }
+    };
+
+    if proof.client_ip != client_ip {
+        writeln!(
+            out,
+            "❌  The verification service observed this host at {}, but the daemon is \
+             provisioning {client_ip}.",
+            proof.client_ip
+        )?;
+        return Err(eyre::eyre!(
+            "IP ownership verification saw {} while the daemon reports {client_ip}. The \
+             verification request and the tunnel would leave this host by different paths. Set \
+             --client-ip on the daemon to the address the tunnel must use, or point \
+             --ip-verifier-url at a verifier reachable over that path.",
+            proof.client_ip
+        ));
+    }
+
+    writeln!(out, "    IP ownership verified for {client_ip}")?;
+    Ok(Some(proof))
+}
+
 impl Connect {
     pub async fn execute<D: DaemonClient, L: LedgerClient, W: Write>(
+        self,
+        ctx: &CliContext,
+        daemon: &D,
+        ledger: &L,
+        out: &mut W,
+    ) -> eyre::Result<()> {
+        // The flag wins over the environment default, which in turn is overridable by
+        // DZ_IP_VERIFIER_URL inside `config()`.
+        let verifier_url = match &self.ip_verifier_url {
+            Some(url) => Some(url.clone()),
+            None => ctx.env.config().ok().and_then(|c| c.ip_verifier_url),
+        };
+        let proof_client = HttpIpProofClient::new(verifier_url);
+        self.execute_with_proof_client(ctx, daemon, ledger, &proof_client, out)
+            .await
+    }
+
+    /// The body of [`Connect::execute`], with the verification service abstracted so tests can
+    /// drive every branch without an HTTP server.
+    pub async fn execute_with_proof_client<
+        D: DaemonClient,
+        L: LedgerClient,
+        P: IpProofClient,
+        W: Write,
+    >(
         self,
         _ctx: &CliContext,
         daemon: &D,
         ledger: &L,
+        proof_client: &P,
         out: &mut W,
     ) -> eyre::Result<()> {
         let spinner = init_spinner(5);
@@ -211,10 +318,23 @@ impl Connect {
         writeln!(out, "    DoubleZero ID: {}", ledger.get_payer())?;
         writeln!(out, "⚡  Provisioning for IP: {client_ip_str}")?;
 
+        // RFC-27: one proof per invocation, because one invocation creates users of a single
+        // `user_type`. Requested after the AccessPass pre-flight so a host with no pass fails on
+        // that first — the clearer diagnostic — rather than on a verifier it did not need.
+        let ip_proof = obtain_ip_proof(
+            proof_client,
+            ledger.get_payer(),
+            proof_user_type(&parsed_mode),
+            client_ip,
+            out,
+        )?;
+
         let provisioned = match parsed_mode {
             ParsedDzMode::Ibrl(user_type, tenant) => {
-                self.execute_ibrl(ledger, daemon, user_type, client_ip, tenant, &spinner, out)
-                    .await?;
+                self.execute_ibrl(
+                    ledger, daemon, user_type, client_ip, tenant, ip_proof, &spinner, out,
+                )
+                .await?;
                 true
             }
             ParsedDzMode::Multicast {
@@ -227,6 +347,7 @@ impl Connect {
                     &pub_groups,
                     &sub_groups,
                     client_ip,
+                    ip_proof,
                     &spinner,
                     out,
                 )
@@ -242,6 +363,7 @@ impl Connect {
                     &sub_feeds,
                     &unsub_feeds,
                     client_ip,
+                    ip_proof,
                     &spinner,
                     out,
                 )
@@ -265,12 +387,15 @@ impl Connect {
         user_type: UserType,
         client_ip: Ipv4Addr,
         tenant: Option<String>,
+        ip_proof: Option<IpOwnershipProof>,
         spinner: &ProgressBar,
         out: &mut W,
     ) -> eyre::Result<()> {
         // Look for user
         let (_user_pubkey, user) = self
-            .find_or_create_user(ledger, daemon, &client_ip, spinner, user_type, tenant, out)
+            .find_or_create_user(
+                ledger, daemon, &client_ip, spinner, user_type, tenant, ip_proof, out,
+            )
             .await?;
 
         // Check user status
@@ -291,6 +416,7 @@ impl Connect {
         pub_groups: &[String],
         sub_groups: &[String],
         client_ip: Ipv4Addr,
+        ip_proof: Option<IpOwnershipProof>,
         spinner: &ProgressBar,
         out: &mut W,
     ) -> eyre::Result<bool> {
@@ -316,7 +442,15 @@ impl Connect {
             // makes a zero-argument connect work for a feed customer.
             if !accesspass.feed_seats().is_empty() {
                 return self
-                    .auto_join_purchased_feeds(ledger, daemon, &accesspass, client_ip, spinner, out)
+                    .auto_join_purchased_feeds(
+                        ledger,
+                        daemon,
+                        &accesspass,
+                        client_ip,
+                        ip_proof,
+                        spinner,
+                        out,
+                    )
                     .await;
             }
 
@@ -406,6 +540,7 @@ impl Connect {
                 spinner,
                 &pub_group_pks,
                 &sub_group_pks,
+                ip_proof,
                 out,
             )
             .await?;
@@ -435,6 +570,7 @@ impl Connect {
         sub_feeds: &[String],
         unsub_feeds: &[String],
         client_ip: Ipv4Addr,
+        ip_proof: Option<IpOwnershipProof>,
         spinner: &ProgressBar,
         out: &mut W,
     ) -> eyre::Result<bool> {
@@ -499,7 +635,8 @@ impl Connect {
         let sub_result = match feed_join {
             None => None,
             Some(join) => {
-                let result = self.execute_feed_join(ledger, join, client_ip, spinner, out);
+                let result =
+                    self.execute_feed_join(ledger, join, client_ip, ip_proof, spinner, out);
                 if result.is_ok() {
                     writeln!(out, "    Joined feed(s): {}", sub_feeds.join(", "))?;
                 }
@@ -555,12 +692,14 @@ impl Connect {
     /// deliberate: exiting 0 with nothing subscribed is indistinguishable from success to an
     /// unattended installer. A re-run that holds a feed already still activates the user: a
     /// disabled reconciler must not go unnoticed just because nothing new needed joining.
+    #[allow(clippy::too_many_arguments)]
     async fn auto_join_purchased_feeds<D: DaemonClient, L: LedgerClient, W: Write>(
         &self,
         ledger: &L,
         daemon: &D,
         accesspass: &AccessPass,
         client_ip: Ipv4Addr,
+        ip_proof: Option<IpOwnershipProof>,
         spinner: &ProgressBar,
         out: &mut W,
     ) -> eyre::Result<bool> {
@@ -872,6 +1011,7 @@ impl Connect {
                 feed_pks: selection.join,
             },
             client_ip,
+            ip_proof,
             spinner,
             out,
         )?;
@@ -1066,6 +1206,7 @@ impl Connect {
         ledger: &L,
         join: FeedJoin,
         client_ip: Ipv4Addr,
+        ip_proof: Option<IpOwnershipProof>,
         spinner: &ProgressBar,
         out: &mut W,
     ) -> eyre::Result<()> {
@@ -1084,7 +1225,7 @@ impl Connect {
                     client_ip,
                     tunnel_endpoint,
                     tenant_pk: None,
-                    ip_proof: None,
+                    ip_proof,
                 })?;
                 spinner.set_message("Multicast user created");
                 user_pk
@@ -1264,6 +1405,7 @@ impl Connect {
         spinner: &ProgressBar,
         user_type: UserType,
         tenant: Option<String>,
+        ip_proof: Option<IpOwnershipProof>,
         out: &mut W,
     ) -> eyre::Result<(Pubkey, User)> {
         spinner.set_message("Searching for user account...");
@@ -1365,7 +1507,7 @@ impl Connect {
                     client_ip: *client_ip,
                     tunnel_endpoint,
                     tenant_pk,
-                    ip_proof: None,
+                    ip_proof,
                 });
 
                 match res {
@@ -1397,6 +1539,7 @@ impl Connect {
         spinner: &ProgressBar,
         pub_group_pks: &[Pubkey],
         sub_group_pks: &[Pubkey],
+        ip_proof: Option<IpOwnershipProof>,
         out: &mut W,
     ) -> eyre::Result<(Pubkey, User)> {
         spinner.set_message("Searching for user account...");
@@ -1485,7 +1628,7 @@ impl Connect {
                     tunnel_endpoint,
                     owner: None,
                     feed_pk: None,
-                    ip_proof: None,
+                    ip_proof,
                 });
 
                 let user_pk = match res {
@@ -1624,7 +1767,7 @@ impl Connect {
                     tunnel_endpoint,
                     owner: None,
                     feed_pk: None,
-                    ip_proof: None,
+                    ip_proof,
                 });
 
                 let user_pk = match res {
@@ -2102,6 +2245,7 @@ mod tests {
             DoubleZeroStatus, LatencyRecord, LatencyResponse, MockDaemonClient, StatusResponse,
             V2StatusResponse,
         },
+        ip_proof::MockIpProofClient,
         ledger::MockLedgerClient,
     };
     use doublezero_cli_core::testing::{block_on, cli_context_default_for_tests};
@@ -2788,6 +2932,18 @@ mod tests {
             user: &User,
             tenant_pk: Option<Pubkey>,
         ) {
+            self.expect_create_user_with_tenant_and_proof(pk, user, tenant_pk, None);
+        }
+
+        /// The RFC-27 variant: asserts the exact proof the command carries, so a test can pin
+        /// that the proof the verification service returned is the one that reaches the SDK.
+        pub fn expect_create_user_with_tenant_and_proof(
+            &mut self,
+            pk: Pubkey,
+            user: &User,
+            tenant_pk: Option<Pubkey>,
+            ip_proof: Option<IpOwnershipProof>,
+        ) {
             let expected_create_user_command = CreateUserCommand {
                 user_type: user.user_type,
                 device_pk: user.device_pk,
@@ -2795,7 +2951,7 @@ mod tests {
                 client_ip: user.client_ip,
                 tunnel_endpoint: user.tunnel_endpoint,
                 tenant_pk,
-                ip_proof: None,
+                ip_proof,
             };
 
             let users = self.users.clone();
@@ -2822,6 +2978,22 @@ mod tests {
             publisher: bool,
             subscriber: bool,
         ) {
+            self.expect_create_subscribe_user_with_proof(
+                pk, user, mgroup_pks, publisher, subscriber, None,
+            );
+        }
+
+        /// The RFC-27 variant: asserts the exact proof the command carries.
+        #[allow(clippy::too_many_arguments)]
+        pub fn expect_create_subscribe_user_with_proof(
+            &mut self,
+            pk: Pubkey,
+            user: &User,
+            mgroup_pks: Vec<Pubkey>,
+            publisher: bool,
+            subscriber: bool,
+            ip_proof: Option<IpOwnershipProof>,
+        ) {
             let expected_create_subscribe_user_command = CreateSubscribeUserCommand {
                 user_type: user.user_type,
                 device_pk: user.device_pk,
@@ -2833,7 +3005,7 @@ mod tests {
                 tunnel_endpoint: user.tunnel_endpoint,
                 owner: None,
                 feed_pk: None,
-                ip_proof: None,
+                ip_proof,
             };
 
             let users = self.users.clone();
@@ -3001,13 +3173,69 @@ mod tests {
 
     /// Run `connect` against the fixture's mocks with a captured writer,
     /// returning the result and the writer output.
+    ///
+    /// Defaults to an environment with no verification service, which is the pre-RFC-27
+    /// behavior every test below other than the proof tests is asserting.
     async fn run(fixture: &TestFixture, command: Connect) -> (eyre::Result<()>, String) {
+        run_with_proof_client(fixture, command, no_verifier()).await
+    }
+
+    /// The same, with a verification service the test controls.
+    async fn run_with_proof_client(
+        fixture: &TestFixture,
+        command: Connect,
+        proof_client: MockIpProofClient,
+    ) -> (eyre::Result<()>, String) {
         let ctx = cli_context_default_for_tests();
         let mut out = Vec::new();
         let result = command
-            .execute(&ctx, &fixture.daemon, &fixture.ledger, &mut out)
+            .execute_with_proof_client(
+                &ctx,
+                &fixture.daemon,
+                &fixture.ledger,
+                &proof_client,
+                &mut out,
+            )
             .await;
         (result, String::from_utf8(out).unwrap())
+    }
+
+    /// An environment with no verifier configured — what every environment looks like until the
+    /// deployment work lands.
+    fn no_verifier() -> MockIpProofClient {
+        let mut client = MockIpProofClient::new();
+        client
+            .expect_request_proof()
+            .returning(|_, _, _| Err(IpProofError::NotConfigured));
+        client
+    }
+
+    /// A verifier that signs `client_ip` for whatever it is asked, recording the `user_type` it
+    /// was asked for so a test can assert the proof is bound to the user actually being created.
+    fn verifier_for(client_ip: Ipv4Addr) -> (MockIpProofClient, Arc<Mutex<Vec<UserType>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let mut client = MockIpProofClient::new();
+        client
+            .expect_request_proof()
+            .returning_st(move |payer, user_type, _source| {
+                recorded.lock().unwrap().push(user_type);
+                Ok(test_proof(payer, client_ip, user_type))
+            });
+        (client, seen)
+    }
+
+    /// A proof with a placeholder signature: nothing client-side verifies it, and the program
+    /// side is covered by the serviceability tests.
+    fn test_proof(payer: Pubkey, client_ip: Ipv4Addr, user_type: UserType) -> IpOwnershipProof {
+        IpOwnershipProof {
+            version: 1,
+            payer,
+            client_ip,
+            epoch: 10,
+            user_type: user_type as u8,
+            signature: [3u8; 64],
+        }
     }
 
     #[test]
@@ -3032,6 +3260,7 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -3067,12 +3296,226 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
             let (result, output) = run(&fixture, command).await;
             assert!(result.is_ok());
             assert!(output.contains("Creating separate Multicast user for concurrent tunnels"));
+        });
+    }
+
+    // ========================================================================
+    // RFC-27 IP ownership proof (issue #4201)
+    // ========================================================================
+
+    /// An IBRL connect where the verification service answers: the proof it signed is the one
+    /// that reaches the SDK, and it is bound to the `user_type` being created.
+    #[test]
+    fn test_connect_attaches_the_ip_proof_the_service_issued() {
+        block_on(async {
+            let mut fixture = TestFixture::new();
+            let (tenant_pk, tenant) = fixture.add_tenant("proof-tenant");
+            let (device1_pk, _) = fixture.add_device(DeviceType::Hybrid, 100, true);
+            fixture.add_device(DeviceType::Hybrid, 110, true);
+
+            let user = fixture.create_user(UserType::IBRL, device1_pk, "1.2.3.4");
+            let payer = fixture.ledger.get_payer();
+            let proof = test_proof(payer, user.client_ip, UserType::IBRL);
+            fixture.expect_create_user_with_tenant_and_proof(
+                Pubkey::new_unique(),
+                &user,
+                Some(tenant_pk),
+                Some(proof),
+            );
+
+            let command = Connect {
+                dz_mode: DzMode::IBRL {
+                    tenant: Some(tenant.code.clone()),
+                    allocate_addr: false,
+                },
+                client_ip: None,
+                device: None,
+                ip_verifier_url: None,
+                verbose: false,
+            };
+
+            let (verifier, user_types) = verifier_for(user.client_ip);
+            let (result, output) = run_with_proof_client(&fixture, command, verifier).await;
+
+            assert!(result.is_ok(), "{result:?}\n{output}");
+            assert!(
+                output.contains("IP ownership verified for 1.2.3.4"),
+                "{output}"
+            );
+            // The proof binds `user_type`, so a proof requested for the wrong one would be
+            // rejected onchain even though every other field matched.
+            assert_eq!(*user_types.lock().unwrap(), vec![UserType::IBRL]);
+        });
+    }
+
+    /// A multicast connect asks for a proof bound to `Multicast`, not to the IBRL type the
+    /// unicast path uses.
+    #[test]
+    fn test_connect_binds_the_proof_to_the_multicast_user_type() {
+        block_on(async {
+            let mut fixture = TestFixture::new();
+            let (mcast_group_pk, _) = fixture.add_multicast_group("test-group", "239.0.0.1");
+            let (device_pk, _) = fixture.add_device(DeviceType::Hybrid, 100, true);
+
+            let mcast_user = fixture.create_user(UserType::Multicast, device_pk, "1.2.3.4");
+            let payer = fixture.ledger.get_payer();
+            fixture.expect_create_subscribe_user_with_proof(
+                Pubkey::new_unique(),
+                &mcast_user,
+                vec![mcast_group_pk],
+                true,
+                false,
+                Some(test_proof(payer, mcast_user.client_ip, UserType::Multicast)),
+            );
+
+            let command = Connect {
+                dz_mode: DzMode::Multicast {
+                    mode: Some(MulticastMode::Publisher),
+                    multicast_groups: vec!["test-group".to_string()],
+                    pub_groups: vec![],
+                    sub_groups: vec![],
+                    sub_feeds: vec![],
+                    unsub_feeds: vec![],
+                },
+                client_ip: None,
+                device: None,
+                ip_verifier_url: None,
+                verbose: false,
+            };
+
+            let (verifier, user_types) = verifier_for(mcast_user.client_ip);
+            let (result, output) = run_with_proof_client(&fixture, command, verifier).await;
+
+            assert!(result.is_ok(), "{result:?}\n{output}");
+            assert_eq!(*user_types.lock().unwrap(), vec![UserType::Multicast]);
+        });
+    }
+
+    /// An unreachable service must not take a host offline. Creation proceeds without a proof,
+    /// which the program accepts until enforcement is switched on — and the operator is told.
+    #[test]
+    fn test_connect_continues_without_a_proof_when_the_service_is_unreachable() {
+        block_on(async {
+            let mut fixture = TestFixture::new();
+            let (tenant_pk, tenant) = fixture.add_tenant("proof-tenant");
+            let (device1_pk, _) = fixture.add_device(DeviceType::Hybrid, 100, true);
+            fixture.add_device(DeviceType::Hybrid, 110, true);
+
+            let user = fixture.create_user(UserType::IBRL, device1_pk, "1.2.3.4");
+            // `expect_create_user_with_tenant` pins `ip_proof: None`, so this test fails if the
+            // fallback ever starts attaching something.
+            fixture.expect_create_user_with_tenant(Pubkey::new_unique(), &user, Some(tenant_pk));
+
+            let command = Connect {
+                dz_mode: DzMode::IBRL {
+                    tenant: Some(tenant.code.clone()),
+                    allocate_addr: false,
+                },
+                client_ip: None,
+                device: None,
+                ip_verifier_url: None,
+                verbose: false,
+            };
+
+            let mut verifier = MockIpProofClient::new();
+            verifier.expect_request_proof().returning(|_, _, _| {
+                Err(IpProofError::Unreachable {
+                    url: "http://ip-verifier.example:8080/v1/proof".to_string(),
+                    detail: "connection refused".to_string(),
+                })
+            });
+
+            let (result, output) = run_with_proof_client(&fixture, command, verifier).await;
+
+            assert!(result.is_ok(), "{result:?}\n{output}");
+            assert!(output.contains("could not reach"), "{output}");
+            assert!(
+                output.contains("Continuing without an IP ownership proof"),
+                "{output}"
+            );
+        });
+    }
+
+    /// A CGNAT or RFC-1918 source address is a refusal, not an outage. The operator needs the
+    /// service's own reason, because the remedy is theirs, not ours.
+    #[test]
+    fn test_connect_reports_a_non_routable_source_address_and_continues() {
+        block_on(async {
+            let mut fixture = TestFixture::new();
+            let (tenant_pk, tenant) = fixture.add_tenant("proof-tenant");
+            let (device1_pk, _) = fixture.add_device(DeviceType::Hybrid, 100, true);
+            fixture.add_device(DeviceType::Hybrid, 110, true);
+
+            let user = fixture.create_user(UserType::IBRL, device1_pk, "1.2.3.4");
+            fixture.expect_create_user_with_tenant(Pubkey::new_unique(), &user, Some(tenant_pk));
+
+            let command = Connect {
+                dz_mode: DzMode::IBRL {
+                    tenant: Some(tenant.code.clone()),
+                    allocate_addr: false,
+                },
+                client_ip: None,
+                device: None,
+                ip_verifier_url: None,
+                verbose: false,
+            };
+
+            let mut verifier = MockIpProofClient::new();
+            verifier.expect_request_proof().returning(|_, _, _| {
+                Err(IpProofError::Declined {
+                    reason: "not_globally_routable".to_string(),
+                    message: "100.64.3.9 is not a globally routable address".to_string(),
+                })
+            });
+
+            let (result, output) = run_with_proof_client(&fixture, command, verifier).await;
+
+            assert!(result.is_ok(), "{result:?}\n{output}");
+            assert!(output.contains("not_globally_routable"), "{output}");
+            assert!(output.contains("100.64.3.9"), "{output}");
+        });
+    }
+
+    /// The one hard failure: the service saw a different address than the one being provisioned.
+    /// Attaching the proof would be rejected onchain and dropping it would bind an address nobody
+    /// proved, so `connect` stops and names both.
+    #[test]
+    fn test_connect_fails_when_the_service_saw_a_different_address() {
+        block_on(async {
+            let mut fixture = TestFixture::new();
+            let (_, tenant) = fixture.add_tenant("proof-tenant");
+            fixture.add_device(DeviceType::Hybrid, 100, true);
+            fixture.add_device(DeviceType::Hybrid, 110, true);
+            // No create_user expectation: reaching the ledger at all is the failure.
+
+            let command = Connect {
+                dz_mode: DzMode::IBRL {
+                    tenant: Some(tenant.code.clone()),
+                    allocate_addr: false,
+                },
+                client_ip: None,
+                device: None,
+                ip_verifier_url: None,
+                verbose: false,
+            };
+
+            // The daemon reports 1.2.3.4; the service egressed by another path and saw 9.9.9.9.
+            let (verifier, _) = verifier_for(Ipv4Addr::new(9, 9, 9, 9));
+            let (result, output) = run_with_proof_client(&fixture, command, verifier).await;
+
+            let err = result.expect_err("a proof for another address must stop the connect");
+            let message = err.to_string();
+            assert!(message.contains("9.9.9.9"), "{message}");
+            assert!(message.contains("1.2.3.4"), "{message}");
+            assert!(output.contains("9.9.9.9"), "{output}");
+            assert!(output.contains("1.2.3.4"), "{output}");
         });
     }
 
@@ -3098,6 +3541,7 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -3128,6 +3572,7 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -3151,6 +3596,7 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -3179,6 +3625,7 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -3206,6 +3653,7 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -3229,6 +3677,7 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -3255,6 +3704,7 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -3292,6 +3742,7 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -3344,6 +3795,7 @@ mod tests {
                 },
                 client_ip: None,
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -3394,6 +3846,7 @@ mod tests {
                 },
                 client_ip: None,
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -3430,6 +3883,7 @@ mod tests {
                 },
                 client_ip: None,
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -3479,6 +3933,7 @@ mod tests {
                 },
                 client_ip: None,
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -3506,6 +3961,7 @@ mod tests {
             },
             client_ip: None,
             device: None,
+            ip_verifier_url: None,
             verbose: false,
         };
 
@@ -3554,6 +4010,7 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -3596,6 +4053,7 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -3647,6 +4105,7 @@ mod tests {
                 },
                 client_ip: Some(ibrl_user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -3699,6 +4158,7 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -3748,6 +4208,7 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -3776,6 +4237,7 @@ mod tests {
                 },
                 client_ip: Some("1.2.3.4".to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -3836,6 +4298,7 @@ mod tests {
             },
             client_ip: Some(user.client_ip.to_string()),
             device: None,
+            ip_verifier_url: None,
             verbose: false,
         };
 
@@ -3864,6 +4327,7 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -3913,6 +4377,7 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -3958,6 +4423,7 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4006,6 +4472,7 @@ mod tests {
             },
             client_ip: Some(user.client_ip.to_string()),
             device: None,
+            ip_verifier_url: None,
             verbose: false,
         };
 
@@ -4058,6 +4525,7 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4076,6 +4544,7 @@ mod tests {
                 },
                 client_ip: Some(ibrl_user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4121,6 +4590,7 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4149,6 +4619,7 @@ mod tests {
                 },
                 client_ip: Some(ibrl_user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4181,6 +4652,7 @@ mod tests {
                 },
                 client_ip: Some("1.2.3.4".to_string()),
                 device: Some(device.code.clone()), // Explicitly specify the device
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4224,6 +4696,7 @@ mod tests {
                 },
                 client_ip: Some("1.2.3.4".to_string()),
                 device: Some(device.code.clone()), // Explicitly specify the device
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4262,6 +4735,7 @@ mod tests {
                 },
                 client_ip: Some("1.2.3.4".to_string()),
                 device: None, // auto-select
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4310,6 +4784,7 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None, // auto-select
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4357,6 +4832,7 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4393,6 +4869,7 @@ mod tests {
                 },
                 client_ip: Some("1.2.3.4".to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4428,6 +4905,7 @@ mod tests {
                 },
                 client_ip: Some("1.2.3.4".to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4457,6 +4935,7 @@ mod tests {
                 },
                 client_ip: Some("1.2.3.4".to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4482,6 +4961,7 @@ mod tests {
                 },
                 client_ip: Some("1.2.3.4".to_string()),
                 device: Some("nonexistent-device".to_string()), // Device that doesn't exist
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4515,6 +4995,7 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4564,6 +5045,7 @@ mod tests {
                 },
                 client_ip: Some(ibrl_user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4610,6 +5092,7 @@ mod tests {
                 },
                 client_ip: Some(ibrl_user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4657,6 +5140,7 @@ mod tests {
                 },
                 client_ip: Some(user.client_ip.to_string()),
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4697,6 +5181,7 @@ mod tests {
                 },
                 client_ip: None,
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4733,6 +5218,7 @@ mod tests {
                 },
                 client_ip: None,
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4774,6 +5260,7 @@ mod tests {
                 },
                 client_ip: None,
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4807,6 +5294,7 @@ mod tests {
                 },
                 client_ip: None,
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4838,6 +5326,7 @@ mod tests {
                 },
                 client_ip: None,
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4877,6 +5366,7 @@ mod tests {
                 },
                 client_ip: None,
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -4900,6 +5390,7 @@ mod tests {
             },
             client_ip: None,
             device: None,
+            ip_verifier_url: None,
             verbose: false,
         }
     }
@@ -5381,6 +5872,7 @@ mod tests {
                 },
                 client_ip: None,
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -5409,6 +5901,7 @@ mod tests {
                 },
                 client_ip: None,
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -5447,6 +5940,7 @@ mod tests {
                 },
                 client_ip: None,
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -5494,6 +5988,7 @@ mod tests {
                 },
                 client_ip: None,
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -5539,6 +6034,7 @@ mod tests {
                 },
                 client_ip: None,
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
@@ -5593,6 +6089,7 @@ mod tests {
                 },
                 client_ip: None,
                 device: None,
+                ip_verifier_url: None,
                 verbose: false,
             };
 
