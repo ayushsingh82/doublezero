@@ -31,17 +31,31 @@ use tracing::debug;
 /// flag is clear. [`MAX_ATTEMPTS`] of these plus the delay between them is the whole budget.
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(2500);
 
-/// Abandon one address this fast so a second DNS answer is actually reached. hyper tries the
-/// resolved addresses in sequence, but its happy-eyeballs timer only crosses address families,
-/// not two A records — so without a connect timeout a blackholed address (SYN dropped, which is
-/// how a host that is down or firewalled usually fails) burns the entire request budget and its
-/// siblings are never tried. Redundant A records are then a coin flip rather than redundancy.
+/// The whole connect budget, so a second DNS answer is actually reached. hyper tries the resolved
+/// addresses in sequence, but its happy-eyeballs timer only crosses address families, not two A
+/// records — so without a connect timeout a blackholed address (SYN dropped, which is how a host
+/// that is down or firewalled usually fails) burns the entire request budget and its siblings are
+/// never tried. Redundant A records are then a coin flip rather than redundancy.
+///
+/// Note this is a *total*, not a per-address value: hyper-util divides it by the number of
+/// resolved addresses (`connect/http.rs`, `ConnectingTcpRemote::new`), so one A record gets the
+/// full second and eight get 125ms each — less than a single cross-ocean RTT, which would abandon
+/// healthy hosts. The value is sized for the one-address case that holds today. Whether a fleet
+/// behind this name should raise it, or sit behind a single load-balancer or anycast VIP so it
+/// stays one address, belongs with the deployment work in #4199.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Attempts before giving up. `POST /v1/proof` is idempotent — it signs the address it observes
-/// and holds no per-request state — so a retry cannot double anything, and a second attempt may
-/// resolve to a healthy host behind the same name. Only a transport error or a 5xx is retried:
-/// a decline (`rate_limited` above all) and a malformed body are answers that will not change.
+/// and holds no per-request state — so a retry cannot double anything. Only a transport error or
+/// a 5xx is retried: a decline (`rate_limited` above all) and a malformed body are answers that
+/// will not change.
+///
+/// What the second attempt buys is a transient blip, not failover. A transport error leaves no
+/// pooled connection, so that retry does redial and can land on a different resolved address; a
+/// 5xx came from a host that is up, whose keep-alive connection the pool will hand straight back,
+/// and which hyper would try first even on a fresh dial. Reaching a *different* backend is
+/// therefore a load balancer's or an anycast VIP's job, in front of the fleet — see #4199 — not
+/// something a deeper retry here could add.
 const MAX_ATTEMPTS: u32 = 2;
 
 /// Between attempts. Short, for the same reason the timeout is.
@@ -124,41 +138,79 @@ impl HttpIpProofClient {
     /// Blocking on purpose: it sits alongside `LedgerClient`'s blocking RPC calls in the same
     /// `connect` code path, and one short request per invocation does not justify a second
     /// async HTTP stack in this crate.
+    ///
+    /// `binding` decides whether the request is pinned to the tunnel's source address; see
+    /// [`probe_source_binding`] for why that is decided here rather than left to reqwest.
     fn build(
+        binding: SourceBinding,
         source_addr: Ipv4Addr,
         url: &str,
-    ) -> Result<(reqwest::blocking::Client, bool), IpProofError> {
-        // Bind the request to the address the tunnel will use, so a multi-homed host proves the
-        // right one. On a NATed host that address is not assigned to any local interface and the
-        // bind fails, which is expected, not an error: fall back to an unbound request, where
-        // the service observes the NAT's public address — the same address the daemon
-        // discovered. Both paths are reported, because a silent fallback on a multi-homed host
-        // would prove the wrong address.
-        match reqwest::blocking::Client::builder()
+    ) -> Result<reqwest::blocking::Client, IpProofError> {
+        // Never through a proxy, whatever HTTP_PROXY and friends say. reqwest honours the system
+        // proxy by default, and a proxied request would terminate at the proxy: the verifier's
+        // peer address would be the proxy's, the source binding below would apply only to the
+        // hop to the proxy, and the proof would name an address this host cannot originate from.
+        // `connect` would then abort on the mismatch, on a host where it used to work. A
+        // proxy-only host instead reports "unreachable" and continues without a proof, which is
+        // the non-fatal path.
+        let mut builder = reqwest::blocking::Client::builder()
+            .no_proxy()
             .timeout(REQUEST_TIMEOUT)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .local_address(Some(std::net::IpAddr::V4(source_addr)))
-            .build()
-        {
-            Ok(client) => Ok((client, true)),
-            Err(bind_err) => {
-                debug!(
-                    %source_addr,
-                    error = %bind_err,
-                    "could not bind the verification request to the tunnel source address; \
-                     falling back to the host's default egress"
-                );
-                let client = reqwest::blocking::Client::builder()
-                    .timeout(REQUEST_TIMEOUT)
-                    .connect_timeout(CONNECT_TIMEOUT)
-                    .build()
-                    .map_err(|e| IpProofError::Unreachable {
-                        url: url.to_string(),
-                        detail: format!("could not build an HTTP client: {e}"),
-                    })?;
-                Ok((client, false))
-            }
+            .connect_timeout(CONNECT_TIMEOUT);
+
+        if binding == SourceBinding::Bind {
+            builder = builder.local_address(Some(std::net::IpAddr::V4(source_addr)));
         }
+
+        builder.build().map_err(|e| IpProofError::Unreachable {
+            url: url.to_string(),
+            detail: format!("could not build an HTTP client: {e}"),
+        })
+    }
+}
+
+/// Whether the verification request should be pinned to the tunnel's source address.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum SourceBinding {
+    /// The address is assigned to this host and is a legal source toward the verifier.
+    Bind,
+    /// The address is on no local interface. The ordinary NATed host: `client_ip` is the NAT's
+    /// public address, which is what the service will observe over the default egress anyway.
+    NotLocal,
+    /// The host owns the address but cannot reach the verifier from it. The request and the
+    /// tunnel would leave by different paths, so the proof would name the wrong address.
+    Unroutable,
+    /// The verifier's name did not resolve. The request itself will report that, with a better
+    /// message than a binding probe could.
+    Unresolved,
+}
+
+/// Decides whether `source_addr` can actually originate the request to `url`.
+///
+/// This has to be probed rather than attempted, because reqwest's `local_address` is only stored
+/// in the connector config — the `bind()` happens per connection inside hyper, so `build()`
+/// succeeds for an address that is assigned to nothing and the failure surfaces later as an
+/// unremarkable connect error.
+///
+/// A UDP socket answers both halves of the question without sending a packet: `bind` asks the
+/// kernel whether the address is assigned to this host, and `connect` is a pure route lookup
+/// asking whether it is a legal source for that destination. The second half matters as much as
+/// the first — a non-loopback source toward `127.0.0.1` fails with `EINVAL`, which is exactly the
+/// localnet default.
+fn probe_source_binding(source_addr: Ipv4Addr, url: &str) -> SourceBinding {
+    let Ok(socket) = std::net::UdpSocket::bind((source_addr, 0)) else {
+        return SourceBinding::NotLocal;
+    };
+    let Some(addrs) = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.socket_addrs(|| None).ok())
+    else {
+        return SourceBinding::Unresolved;
+    };
+    if addrs.iter().any(|addr| socket.connect(addr).is_ok()) {
+        SourceBinding::Bind
+    } else {
+        SourceBinding::Unroutable
     }
 }
 
@@ -175,8 +227,25 @@ impl IpProofClient for HttpIpProofClient {
             .ok_or(IpProofError::NotConfigured)?;
         let url = format!("{}/v1/proof", base_url.trim_end_matches('/'));
 
-        let (client, bound) = Self::build(source_addr, &url)?;
-        debug!(%url, %payer, bound, "requesting an IP ownership proof");
+        // Bind the request to the address the tunnel will use, so a multi-homed host whose
+        // operator set --client-ip on the daemon proves that address rather than whichever one
+        // the default route prefers. Where the address cannot originate the request, fall back
+        // to the default egress: on a NATed host the service observes the NAT's public address,
+        // which is the same address the daemon discovered.
+        let binding = probe_source_binding(source_addr, &url);
+        match binding {
+            SourceBinding::Unroutable => tracing::warn!(
+                %source_addr,
+                %url,
+                "this host cannot reach the verification service from the address being \
+                 provisioned; the request will use the default egress and the service will \
+                 observe a different address"
+            ),
+            other => debug!(%source_addr, %url, binding = ?other, "verification request source"),
+        }
+
+        let client = Self::build(binding, source_addr, &url)?;
+        debug!(%url, %payer, "requesting an IP ownership proof");
 
         // The client is built once and reused, so a retry re-resolves through the same pool
         // rather than rebuilding a socket binding that already succeeded or already failed.
@@ -241,7 +310,7 @@ fn attempt_request(
             false,
         )
     })?;
-    proof_from_response(parsed).map_err(|e| (e, false))
+    proof_from_response(parsed, payer, user_type).map_err(|e| (e, false))
 }
 
 /// Turns a non-success response into the reason the operator sees, and says whether another
@@ -265,9 +334,39 @@ fn classify_failure(status: reqwest::StatusCode, body: &str) -> (IpProofError, b
 
 /// Converts the wire form into the struct the instruction carries, rejecting anything the
 /// program would reject anyway.
-fn proof_from_response(parsed: ProofResponse) -> Result<IpOwnershipProof, IpProofError> {
+///
+/// `requested_payer` and `requested_user_type` are what this client asked for. The proof binds
+/// both, and the program checks both, so a proof that names something else is one the transaction
+/// would pay for and then be refused. Catching it here turns that into the clean "continuing
+/// without a proof" path instead.
+fn proof_from_response(
+    parsed: ProofResponse,
+    requested_payer: Pubkey,
+    requested_user_type: UserType,
+) -> Result<IpOwnershipProof, IpProofError> {
+    // A verifier rolled forward to a layout this client does not know signs a message this
+    // client cannot reason about. Refuse it rather than forward a proof the program will reject.
+    if !doublezero_ip_proof::is_supported_version(parsed.version) {
+        return Err(IpProofError::Malformed(format!(
+            "proof layout version {} is not supported by this client (supported: {:?})",
+            parsed.version,
+            doublezero_ip_proof::SUPPORTED_IP_PROOF_VERSIONS,
+        )));
+    }
+
     let payer = Pubkey::from_str(&parsed.payer)
         .map_err(|e| IpProofError::Malformed(format!("payer '{}': {e}", parsed.payer)))?;
+    if payer != requested_payer {
+        return Err(IpProofError::Malformed(format!(
+            "proof names payer {payer}, but {requested_payer} was requested"
+        )));
+    }
+    if parsed.user_type != requested_user_type as u8 {
+        return Err(IpProofError::Malformed(format!(
+            "proof names user type {}, but {} ({}) was requested",
+            parsed.user_type, requested_user_type, requested_user_type as u8
+        )));
+    }
     let signature = Signature::from_str(&parsed.signature)
         .map_err(|e| IpProofError::Malformed(format!("signature '{}': {e}", parsed.signature)))?;
     let signature: [u8; 64] = signature.as_ref().try_into().map_err(|_| {
@@ -288,6 +387,47 @@ fn proof_from_response(parsed: ProofResponse) -> Result<IpOwnershipProof, IpProo
 mod tests {
     use super::*;
 
+    /// The binding probe has to answer for a real socket, because the thing it is standing in
+    /// for — reqwest's per-connection `bind()` — is not observable at build time.
+    #[test]
+    fn probe_binds_a_local_address_toward_a_reachable_destination() {
+        // A loopback source toward a loopback destination is the one pairing guaranteed to be
+        // legal on every host a test runs on.
+        assert_eq!(
+            probe_source_binding(Ipv4Addr::LOCALHOST, "http://127.0.0.1:8080"),
+            SourceBinding::Bind
+        );
+    }
+
+    #[test]
+    fn probe_skips_an_address_on_no_local_interface() {
+        // The NATed host: `client_ip` is the NAT's public address, assigned to nothing here.
+        assert_eq!(
+            probe_source_binding(Ipv4Addr::new(203, 0, 113, 7), "http://127.0.0.1:8080"),
+            SourceBinding::NotLocal
+        );
+    }
+
+    #[test]
+    fn probe_skips_a_local_address_that_cannot_reach_the_destination() {
+        // The mirror of the localnet default, which is the case this arm exists for: a source
+        // the host owns but which is not a legal source for the route to the destination. No
+        // packet is sent and no name is resolved — the kernel rejects the route lookup itself.
+        assert_eq!(
+            probe_source_binding(Ipv4Addr::LOCALHOST, "http://8.8.8.8:80"),
+            SourceBinding::Unroutable
+        );
+    }
+
+    #[test]
+    fn probe_defers_to_the_request_when_the_url_is_unusable() {
+        // Nothing to bind toward. The request itself reports this better than the probe could.
+        assert_eq!(
+            probe_source_binding(Ipv4Addr::LOCALHOST, "not a url"),
+            SourceBinding::Unresolved
+        );
+    }
+
     fn response() -> ProofResponse {
         // A fixed payer, so a test can rebuild the same response and compare against it.
         ProofResponse {
@@ -300,10 +440,21 @@ mod tests {
         }
     }
 
+    /// The payer and user type `response()` was issued for, so a test only has to name the field
+    /// it is deliberately breaking.
+    fn requested() -> (Pubkey, UserType) {
+        (Pubkey::from([9u8; 32]), UserType::IBRL)
+    }
+
+    fn parse(wire: ProofResponse) -> Result<IpOwnershipProof, IpProofError> {
+        let (payer, user_type) = requested();
+        proof_from_response(wire, payer, user_type)
+    }
+
     #[test]
     fn test_proof_from_response_round_trips_the_wire_form() {
         let wire = response();
-        let proof = proof_from_response(response()).expect("a well-formed response must parse");
+        let proof = parse(response()).expect("a well-formed response must parse");
 
         assert_eq!(proof.version, 1);
         assert_eq!(proof.payer.to_string(), wire.payer);
@@ -315,7 +466,7 @@ mod tests {
 
     #[test]
     fn test_proof_from_response_rejects_a_bad_signature() {
-        let err = proof_from_response(ProofResponse {
+        let err = parse(ProofResponse {
             signature: "not-base58!".to_string(),
             ..response()
         })
@@ -325,7 +476,7 @@ mod tests {
 
     #[test]
     fn test_proof_from_response_rejects_a_bad_payer() {
-        let err = proof_from_response(ProofResponse {
+        let err = parse(ProofResponse {
             payer: "nope".to_string(),
             ..response()
         })
@@ -333,9 +484,46 @@ mod tests {
         assert!(matches!(err, IpProofError::Malformed(_)), "{err}");
     }
 
+    /// A verifier rolled forward to a layout this client does not know. Refusing here is the
+    /// difference between "continuing without a proof" and a user creation that is paid for and
+    /// then refused onchain.
+    #[test]
+    fn test_proof_from_response_rejects_an_unsupported_layout_version() {
+        let err = parse(ProofResponse {
+            version: 2,
+            ..response()
+        })
+        .expect_err("an unknown layout version must not become a proof");
+        assert!(matches!(err, IpProofError::Malformed(_)), "{err}");
+        assert!(err.to_string().contains("version 2"), "{err}");
+    }
+
+    #[test]
+    fn test_proof_from_response_rejects_a_proof_for_another_payer() {
+        let err = parse(ProofResponse {
+            payer: Pubkey::from([3u8; 32]).to_string(),
+            ..response()
+        })
+        .expect_err("a proof naming another payer must not become a proof");
+        assert!(matches!(err, IpProofError::Malformed(_)), "{err}");
+    }
+
+    #[test]
+    fn test_proof_from_response_rejects_a_proof_for_another_user_type() {
+        let err = parse(ProofResponse {
+            user_type: UserType::Multicast as u8,
+            ..response()
+        })
+        .expect_err("a proof naming another user type must not become a proof");
+        assert!(matches!(err, IpProofError::Malformed(_)), "{err}");
+    }
+
     /// Serves one canned response per connection, in order, and reports how many connections it
     /// actually saw. `Connection: close` on every response, so each attempt is its own
-    /// connection and the count is the attempt count.
+    /// connection and the count is the attempt count. Note that is the test making the count
+    /// legible, not what a real server does: against a keep-alive server the retry after a 5xx
+    /// reuses the pooled connection, which is why [`MAX_ATTEMPTS`] claims a transient blip
+    /// rather than failover.
     fn canned_server(responses: Vec<String>) -> (String, std::thread::JoinHandle<usize>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a test listener");
         let url = format!("http://{}", listener.local_addr().expect("a local address"));

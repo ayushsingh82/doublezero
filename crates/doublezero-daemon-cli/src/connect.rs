@@ -175,7 +175,18 @@ fn proof_user_type(mode: &ParsedDzMode) -> UserType {
     }
 }
 
-/// Obtains a proof, or explains why there is none.
+/// Obtains the invocation's RFC-27 proof, once, and only if a user is about to be created.
+///
+/// **Lazy on purpose.** A `connect` that finds its user already provisioned only re-activates it,
+/// and an `--unsubscribe-feed`-only invocation creates nothing at all. Neither attaches a proof,
+/// so neither may fail on one: fetching up front would let a verification problem take an
+/// already-working host offline on a run that would never have used the answer. The fetch
+/// therefore happens at the four points that actually call `create_user` /
+/// `create_subscribe_user`, and nowhere else.
+///
+/// **Cached on purpose.** One invocation only ever creates users of a single `user_type`, and the
+/// proof binds `user_type`, so the several creation paths a multicast `connect` can take all want
+/// the same proof rather than one request each.
 ///
 /// A refusal is not fatal. The program is the enforcement point: without a proof, creation
 /// succeeds while `require-ip-ownership-proof` is clear and fails with a named error once it is
@@ -187,57 +198,112 @@ fn proof_user_type(mode: &ParsedDzMode) -> UserType {
 /// host's verification request and its tunnel traffic leave by different paths, and neither
 /// address is safe to use — attaching the proof guarantees an onchain rejection, and dropping it
 /// binds an address nobody proved.
-fn obtain_ip_proof<P: IpProofClient, W: Write>(
-    proof_client: &P,
+pub struct IpProofFetcher<'a> {
+    client: &'a dyn IpProofClient,
     payer: Pubkey,
     user_type: UserType,
     client_ip: Ipv4Addr,
-    out: &mut W,
-) -> eyre::Result<Option<IpOwnershipProof>> {
-    let proof = match proof_client.request_proof(payer, user_type, client_ip) {
-        Ok(proof) => proof,
-        Err(IpProofError::NotConfigured) => {
-            tracing::debug!("no IP ownership verification service configured; continuing");
-            return Ok(None);
-        }
-        Err(err @ IpProofError::Declined { .. }) => {
-            writeln!(out, "⚠️  {err}")?;
-            writeln!(
-                out,
-                "    Continuing without an IP ownership proof. This will be rejected onchain \
-                 once IP ownership verification is required for this environment."
-            )?;
-            return Ok(None);
-        }
-        Err(err) => {
-            writeln!(out, "⚠️  {err}")?;
-            writeln!(
-                out,
-                "    Continuing without an IP ownership proof. This will be rejected onchain \
-                 once IP ownership verification is required for this environment."
-            )?;
-            return Ok(None);
-        }
-    };
+    /// The settled outcome, so the second creation path in one invocation reuses the first's
+    /// answer instead of asking again. A mismatch is stored rather than raised so that it can be
+    /// raised afresh at each creation site.
+    outcome: std::sync::OnceLock<IpProofOutcome>,
+}
 
-    if proof.client_ip != client_ip {
-        writeln!(
-            out,
-            "❌  The verification service observed this host at {}, but the daemon is \
-             provisioning {client_ip}.",
-            proof.client_ip
-        )?;
-        return Err(eyre::eyre!(
-            "IP ownership verification saw {} while the daemon reports {client_ip}. The \
+/// What one request to the verification service settled on. Separate from `Result` because a
+/// mismatch has to be re-raised at every creation site, and `eyre::Report` is not reusable.
+#[derive(Clone, Copy, Debug)]
+enum IpProofOutcome {
+    /// A proof for the address being provisioned.
+    Proof(IpOwnershipProof),
+    /// No proof, for a reason already reported to the operator. Creation continues without one.
+    None,
+    /// A proof for some other address. `observed` is what the service saw.
+    Mismatch { observed: Ipv4Addr },
+}
+
+impl<'a> IpProofFetcher<'a> {
+    pub fn new(
+        client: &'a dyn IpProofClient,
+        payer: Pubkey,
+        user_type: UserType,
+        client_ip: Ipv4Addr,
+    ) -> Self {
+        Self {
+            client,
+            payer,
+            user_type,
+            client_ip,
+            outcome: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The proof to attach to a user this invocation is about to create, requesting it if this is
+    /// the first creation path to ask. Errors only on an address mismatch.
+    fn get<W: Write>(&self, out: &mut W) -> eyre::Result<Option<IpOwnershipProof>> {
+        let outcome = match self.outcome.get() {
+            Some(outcome) => *outcome,
+            None => {
+                let outcome = self.request(out)?;
+                // A racing `set` cannot happen — `connect` is single-threaded — but preferring
+                // the stored value keeps the cache authoritative either way.
+                *self.outcome.get_or_init(|| outcome)
+            }
+        };
+
+        match outcome {
+            IpProofOutcome::Proof(proof) => Ok(Some(proof)),
+            IpProofOutcome::None => Ok(None),
+            IpProofOutcome::Mismatch { observed } => Err(self.mismatch_error(observed)),
+        }
+    }
+
+    /// The request itself. Every non-mismatch failure is reported and swallowed.
+    fn request<W: Write>(&self, out: &mut W) -> eyre::Result<IpProofOutcome> {
+        let proof = match self
+            .client
+            .request_proof(self.payer, self.user_type, self.client_ip)
+        {
+            Ok(proof) => proof,
+            Err(IpProofError::NotConfigured) => {
+                tracing::debug!("no IP ownership verification service configured; continuing");
+                return Ok(IpProofOutcome::None);
+            }
+            Err(err) => {
+                writeln!(out, "⚠️  {err}")?;
+                writeln!(
+                    out,
+                    "    Continuing without an IP ownership proof. This will be rejected onchain \
+                     once IP ownership verification is required for this environment."
+                )?;
+                return Ok(IpProofOutcome::None);
+            }
+        };
+
+        if proof.client_ip != self.client_ip {
+            writeln!(
+                out,
+                "❌  The verification service observed this host at {}, but the daemon is \
+                 provisioning {}.",
+                proof.client_ip, self.client_ip
+            )?;
+            return Ok(IpProofOutcome::Mismatch {
+                observed: proof.client_ip,
+            });
+        }
+
+        writeln!(out, "    IP ownership verified for {}", self.client_ip)?;
+        Ok(IpProofOutcome::Proof(proof))
+    }
+
+    fn mismatch_error(&self, observed: Ipv4Addr) -> eyre::Report {
+        eyre::eyre!(
+            "IP ownership verification saw {observed} while the daemon reports {}. The \
              verification request and the tunnel would leave this host by different paths. Set \
              --client-ip on the daemon to the address the tunnel must use, or point \
              --ip-verifier-url at a verifier reachable over that path.",
-            proof.client_ip
-        ));
+            self.client_ip
+        )
     }
-
-    writeln!(out, "    IP ownership verified for {client_ip}")?;
-    Ok(Some(proof))
 }
 
 impl Connect {
@@ -252,7 +318,21 @@ impl Connect {
         // DZ_IP_VERIFIER_URL inside `config()`.
         let verifier_url = match &self.ip_verifier_url {
             Some(url) => Some(url.clone()),
-            None => ctx.env.config().ok().and_then(|c| c.ip_verifier_url),
+            None => match ctx.env.config() {
+                Ok(config) => config.ip_verifier_url,
+                // Not fatal — no verifier means no proof, which is the same non-fatal path as an
+                // environment that has none. But it must not look like that path: an operator who
+                // exported DZ_IP_VERIFIER_URL and got no proof has to be able to tell a config
+                // that failed to load from one that correctly names no verifier.
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "could not load the environment config to find the IP ownership \
+                         verification service; continuing as though none is configured"
+                    );
+                    None
+                }
+            },
         };
         let proof_client = HttpIpProofClient::new(verifier_url);
         self.execute_with_proof_client(ctx, daemon, ledger, &proof_client, out)
@@ -319,15 +399,15 @@ impl Connect {
         writeln!(out, "⚡  Provisioning for IP: {client_ip_str}")?;
 
         // RFC-27: one proof per invocation, because one invocation creates users of a single
-        // `user_type`. Requested after the AccessPass pre-flight so a host with no pass fails on
-        // that first — the clearer diagnostic — rather than on a verifier it did not need.
-        let ip_proof = obtain_ip_proof(
+        // `user_type`. Nothing is requested here — see [`IpProofFetcher`] for why the request
+        // waits until a creation path asks for it.
+        let ip_proof = IpProofFetcher::new(
             proof_client,
             ledger.get_payer(),
             proof_user_type(&parsed_mode),
             client_ip,
-            out,
-        )?;
+        );
+        let ip_proof = &ip_proof;
 
         let provisioned = match parsed_mode {
             ParsedDzMode::Ibrl(user_type, tenant) => {
@@ -387,7 +467,7 @@ impl Connect {
         user_type: UserType,
         client_ip: Ipv4Addr,
         tenant: Option<String>,
-        ip_proof: Option<IpOwnershipProof>,
+        ip_proof: &IpProofFetcher<'_>,
         spinner: &ProgressBar,
         out: &mut W,
     ) -> eyre::Result<()> {
@@ -416,7 +496,7 @@ impl Connect {
         pub_groups: &[String],
         sub_groups: &[String],
         client_ip: Ipv4Addr,
-        ip_proof: Option<IpOwnershipProof>,
+        ip_proof: &IpProofFetcher<'_>,
         spinner: &ProgressBar,
         out: &mut W,
     ) -> eyre::Result<bool> {
@@ -570,7 +650,7 @@ impl Connect {
         sub_feeds: &[String],
         unsub_feeds: &[String],
         client_ip: Ipv4Addr,
-        ip_proof: Option<IpOwnershipProof>,
+        ip_proof: &IpProofFetcher<'_>,
         spinner: &ProgressBar,
         out: &mut W,
     ) -> eyre::Result<bool> {
@@ -699,7 +779,7 @@ impl Connect {
         daemon: &D,
         accesspass: &AccessPass,
         client_ip: Ipv4Addr,
-        ip_proof: Option<IpOwnershipProof>,
+        ip_proof: &IpProofFetcher<'_>,
         spinner: &ProgressBar,
         out: &mut W,
     ) -> eyre::Result<bool> {
@@ -1206,7 +1286,7 @@ impl Connect {
         ledger: &L,
         join: FeedJoin,
         client_ip: Ipv4Addr,
-        ip_proof: Option<IpOwnershipProof>,
+        ip_proof: &IpProofFetcher<'_>,
         spinner: &ProgressBar,
         out: &mut W,
     ) -> eyre::Result<()> {
@@ -1225,7 +1305,7 @@ impl Connect {
                     client_ip,
                     tunnel_endpoint,
                     tenant_pk: None,
-                    ip_proof,
+                    ip_proof: ip_proof.get(out)?,
                 })?;
                 spinner.set_message("Multicast user created");
                 user_pk
@@ -1405,7 +1485,7 @@ impl Connect {
         spinner: &ProgressBar,
         user_type: UserType,
         tenant: Option<String>,
-        ip_proof: Option<IpOwnershipProof>,
+        ip_proof: &IpProofFetcher<'_>,
         out: &mut W,
     ) -> eyre::Result<(Pubkey, User)> {
         spinner.set_message("Searching for user account...");
@@ -1507,7 +1587,7 @@ impl Connect {
                     client_ip: *client_ip,
                     tunnel_endpoint,
                     tenant_pk,
-                    ip_proof,
+                    ip_proof: ip_proof.get(out)?,
                 });
 
                 match res {
@@ -1539,7 +1619,7 @@ impl Connect {
         spinner: &ProgressBar,
         pub_group_pks: &[Pubkey],
         sub_group_pks: &[Pubkey],
-        ip_proof: Option<IpOwnershipProof>,
+        ip_proof: &IpProofFetcher<'_>,
         out: &mut W,
     ) -> eyre::Result<(Pubkey, User)> {
         spinner.set_message("Searching for user account...");
@@ -1628,7 +1708,7 @@ impl Connect {
                     tunnel_endpoint,
                     owner: None,
                     feed_pk: None,
-                    ip_proof,
+                    ip_proof: ip_proof.get(out)?,
                 });
 
                 let user_pk = match res {
@@ -1767,7 +1847,7 @@ impl Connect {
                     tunnel_endpoint,
                     owner: None,
                     feed_pk: None,
-                    ip_proof,
+                    ip_proof: ip_proof.get(out)?,
                 });
 
                 let user_pk = match res {
@@ -3480,6 +3560,46 @@ mod tests {
             assert!(result.is_ok(), "{result:?}\n{output}");
             assert!(output.contains("not_globally_routable"), "{output}");
             assert!(output.contains("100.64.3.9"), "{output}");
+        });
+    }
+
+    /// ...but only where a user is actually created. A host whose user already exists attaches
+    /// nothing and binds nothing, so a disagreeing verifier must not take it offline — the
+    /// re-activation it came for has nothing to do with the proof.
+    #[test]
+    fn test_connect_ignores_a_disagreeing_service_when_the_user_already_exists() {
+        block_on(async {
+            let mut fixture = TestFixture::new();
+
+            let (device1_pk, _) = fixture.add_device(DeviceType::Hybrid, 100, true);
+            let mut user =
+                fixture.create_user(UserType::IBRLWithAllocatedIP, device1_pk, "1.2.3.4");
+            user.status = UserStatus::Activated;
+            fixture.add_user(&user);
+
+            let command = Connect {
+                dz_mode: DzMode::IBRL {
+                    tenant: Some("test-tenant".to_string()),
+                    allocate_addr: true,
+                },
+                client_ip: None,
+                device: None,
+                ip_verifier_url: None,
+                verbose: false,
+            };
+
+            // The same disagreement that stops a creation. Nothing must ask for the proof here,
+            // so the mock is set up never to be called at all.
+            let mut verifier = MockIpProofClient::new();
+            verifier.expect_request_proof().never();
+
+            let (result, output) = run_with_proof_client(&fixture, command, verifier).await;
+
+            assert!(result.is_ok(), "{result:?}\n{output}");
+            assert!(
+                output.contains("An account already exists with Pubkey:"),
+                "{output}"
+            );
         });
     }
 

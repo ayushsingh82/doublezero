@@ -83,15 +83,3 @@ pub const ENV_LOCAL_INTERNET_LATENCY_COLLECTOR_PUBKEY: Pubkey =
     Pubkey::from_str_const("3fXen9LP5JUAkaaDJtyLo1ohPiJ2LdzVqAnmhtGgAmwJ");
 pub const ENV_LOCAL_GEOLOCATION_PUBKEY: Pubkey =
     Pubkey::from_str_const("36WA9nUCsJaAQL5h44WYoLezDpocy8Q71NZbtrUN8DyC");
-
-// RFC-27 IP ownership verification service (`doublezero-ip-verifier`). The service signs the
-// source address it observes a request originate from, so this URL has to be reachable from the
-// connecting host — and reachable over the same path the tunnel will use.
-//
-// Only localnet has a default, the verifier's own default listen address, which is what
-// `dev/dzctl` runs (#4204). Deployed URLs for mainnet-beta, testnet, and devnet land with the
-// deployment work (#4199); until then those environments have no verifier, and `doublezero
-// connect` creates users without a proof — which the program accepts while
-// `require-ip-ownership-proof` is clear. `--ip-verifier-url` or `DZ_IP_VERIFIER_URL` points at
-// one in the meantime.
-pub const ENV_LOCAL_IP_VERIFIER_URL: &str = "http://localhost:8080";

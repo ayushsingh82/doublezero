@@ -97,7 +97,7 @@ impl Environment {
                 telemetry_program_id: ENV_LOCAL_TELEMETRY_PUBKEY,
                 internet_latency_collector_pk: ENV_LOCAL_INTERNET_LATENCY_COLLECTOR_PUBKEY,
                 geolocation_program_id: ENV_LOCAL_GEOLOCATION_PUBKEY,
-                ip_verifier_url: Some(ENV_LOCAL_IP_VERIFIER_URL.to_string()),
+                ip_verifier_url: None,
             },
         };
 
@@ -173,9 +173,17 @@ pub struct NetworkConfig {
     pub telemetry_program_id: Pubkey,
     pub internet_latency_collector_pk: Pubkey,
     pub geolocation_program_id: Pubkey,
-    /// Base URL of the RFC-27 IP ownership verification service, or `None` where none is
-    /// deployed yet. `None` is not an error: user creation without a proof is accepted until
-    /// `require-ip-ownership-proof` is set for the environment.
+    /// Base URL of the RFC-27 IP ownership verification service (`doublezero-ip-verifier`), or
+    /// `None` where none is deployed yet. `None` is not an error: user creation without a proof
+    /// is accepted until `require-ip-ownership-proof` is set for the environment.
+    ///
+    /// Every environment is `None` today. Mainnet-beta, testnet, and devnet get their deployed
+    /// URLs with the deployment work (#4199); localnet gets its verifier from `dev/dzctl`
+    /// (#4204), which is what will know whether the CLI reaches it as a container name or on
+    /// the host. A default guessed here would be wrong for one of those two, and the service
+    /// signs the address it observes the request arrive from, so pointing at the wrong host is
+    /// worse than pointing at nothing. `DZ_IP_VERIFIER_URL` and `--ip-verifier-url` cover the
+    /// gap in the meantime.
     pub ip_verifier_url: Option<String>,
 }
 
