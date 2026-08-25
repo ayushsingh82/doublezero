@@ -14,6 +14,7 @@ use doublezero_cli_core::CliContext;
 use doublezero_ip_proof::IpOwnershipProof;
 use doublezero_sdk::{
     commands::{
+        accesspass::check::check_accesspass as check_accesspass_shared,
         multicastgroup::{
             subscribe::{UpdateMulticastGroupRolesCommand, MAX_GROUPS_PER_TRANSACTION},
             subscribe_feed::SubscribeFeedCommand,
@@ -144,26 +145,21 @@ enum FeedJoinUser {
     },
 }
 
-/// AccessPass pre-flight: `Ok(false)` when no pass exists for
-/// `(client_ip, payer)` so the caller can render its own diagnostic before
-/// bailing. With `enforce_epoch`, the pass must also cover the current epoch.
-///
-/// Mirrors `check_accesspass` in `smartcontract/cli/src/requirements.rs` —
-/// keep the two in sync if AccessPass validity semantics change.
+/// AccessPass pre-flight: `Ok(false)` when the caller holds no usable pass, so the caller can
+/// render its own diagnostic before bailing. Delegates to the shared
+/// [`doublezero_sdk::commands::accesspass::check::check_accesspass`], which also probes the
+/// dynamic (0.0.0.0) PDA so a wildcard-seat holder is not turned away here.
 fn check_accesspass<L: LedgerClient>(
     ledger: &L,
     client_ip: Ipv4Addr,
     enforce_epoch: bool,
 ) -> eyre::Result<bool> {
-    let Some(accesspass) = ledger.get_accesspass(client_ip, ledger.get_payer())? else {
-        return Ok(false);
-    };
-
-    if !enforce_epoch {
-        return Ok(true);
-    }
-    let epoch = ledger.get_epoch()?;
-    Ok(accesspass.last_access_epoch >= epoch)
+    check_accesspass_shared(
+        client_ip,
+        enforce_epoch,
+        |client_ip| ledger.get_accesspass(client_ip, ledger.get_payer()),
+        || ledger.get_epoch(),
+    )
 }
 
 /// The RFC-27 `user_type` a parsed mode will create a user as. The proof binds `user_type`, and

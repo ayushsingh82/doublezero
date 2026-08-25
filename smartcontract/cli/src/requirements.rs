@@ -3,7 +3,9 @@ use std::net::Ipv4Addr;
 use crate::doublezerocommand::CliCommand;
 use doublezero_sdk::{
     commands::{
-        accesspass::get::GetAccessPassCommand,
+        accesspass::{
+            check::check_accesspass as check_accesspass_shared, get::GetAccessPassCommand,
+        },
         allowlist::foundation::list::ListFoundationAllowlistCommand,
     },
     get_doublezero_pubkey,
@@ -81,30 +83,27 @@ pub fn check_balance(client: &dyn CliCommand, spinner: Option<&ProgressBar>) -> 
     }
 }
 
-/// Mirrors `check_accesspass` in `doublezero-daemon-cli`
-/// (`crates/doublezero-daemon-cli/src/connect.rs`) — keep the two in sync if
-/// AccessPass validity semantics change.
+/// AccessPass pre-flight for `connect`. Delegates to the shared
+/// [`doublezero_sdk::commands::accesspass::check::check_accesspass`], which also probes the
+/// dynamic (0.0.0.0) PDA so a wildcard-seat holder is not turned away here.
 pub fn check_accesspass(
     client: &dyn CliCommand,
     client_ip: Ipv4Addr,
     enforce_epoch: bool,
 ) -> eyre::Result<bool> {
-    // A missing AccessPass returns Ok(false) (not an error) so the caller can
-    // render its own diagnostic (e.g. the client IP and UserPayer) before
-    // bailing, rather than surfacing a generic "not found" message.
-    let Some((_, accesspass)) = client.get_accesspass(GetAccessPassCommand {
+    check_accesspass_shared(
         client_ip,
-        user_payer: client.get_payer(),
-    })?
-    else {
-        return Ok(false);
-    };
-
-    if !enforce_epoch {
-        return Ok(true);
-    }
-    let epoch = client.get_epoch()?;
-    Ok(accesspass.last_access_epoch >= epoch)
+        enforce_epoch,
+        |client_ip| {
+            Ok(client
+                .get_accesspass(GetAccessPassCommand {
+                    client_ip,
+                    user_payer: client.get_payer(),
+                })?
+                .map(|(_, accesspass)| accesspass))
+        },
+        || client.get_epoch(),
+    )
 }
 
 pub fn check_allowlist(
